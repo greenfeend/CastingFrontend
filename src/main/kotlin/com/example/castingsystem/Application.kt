@@ -1,27 +1,32 @@
 package com.example.castingsystem
 
-import io.ktor.server.application.*
-import io.ktor.server.engine.*
-import io.ktor.server.netty.*
-import io.ktor.server.routing.*
-import io.ktor.server.http.content.*
-import io.ktor.server.response.*
-import io.ktor.server.request.*
-import io.ktor.server.html.*
-import io.ktor.http.*
-import kotlinx.html.*
+import io.github.g0dkar.qrcode.QRCode
 import io.ktor.client.*
 import io.ktor.client.call.*
 import io.ktor.client.engine.cio.*
 import io.ktor.client.plugins.contentnegotiation.*
 import io.ktor.client.request.*
+import io.ktor.http.*
 import io.ktor.serialization.kotlinx.json.*
+import io.ktor.server.application.*
+import io.ktor.server.engine.*
+import io.ktor.server.html.*
+import io.ktor.server.netty.*
+import io.ktor.server.plugins.forwardedheaders.*
+import io.ktor.server.plugins.origin
+import io.ktor.server.request.*
+import io.ktor.server.response.*
+import io.ktor.server.routing.*
+import kotlinx.html.*
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
-import org.jetbrains.exposed.sql.*
-import org.jetbrains.exposed.sql.transactions.transaction
 import org.jetbrains.exposed.dao.id.IntIdTable
+import org.jetbrains.exposed.sql.*
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
+import org.jetbrains.exposed.sql.transactions.transaction
+import java.io.BufferedReader
+import java.io.ByteArrayOutputStream
+import java.io.InputStreamReader
 
 /**
  * Data classes used for (de)serialising responses from the Rust backend.
@@ -36,11 +41,7 @@ data class ModeStatus(val mode: String)
 data class ModeChange(val mode: String)
 
 /**
- * Room model.  This table is stored in Postgres via Exposed and is
- * separate from the Rust sled database.  Rooms can optionally be
- * associated with a device MAC address (e.g. a Chromecast).  You could
- * extend this model to store additional metadata such as the
- * geographical location or capacity of the room.
+ * Room model.
  */
 @Serializable
 data class Room(val id: Int, val name: String, val deviceMac: String?)
@@ -50,38 +51,72 @@ object Rooms : IntIdTable() {
     val deviceMac = varchar("device_mac", 255).nullable()
 }
 
+/**
+ * Executes a shell command and returns its output.
+ */
+fun executeCommand(command: String): String? {
+    return try {
+        val process = ProcessBuilder(*command.split(" ").toTypedArray())
+            .redirectErrorStream(true)
+            .start()
+        val reader = BufferedReader(InputStreamReader(process.inputStream))
+        val output = reader.readText()
+        process.waitFor()
+        output
+    } catch (e: Exception) {
+        e.printStackTrace()
+        null
+    }
+}
+
+/**
+ * Gets the MAC address for a given IP address by querying the ARP table.
+ */
+fun getMacAddressFromIp(ip: String): String? {
+    val os = System.getProperty("os.name").toLowerCase()
+    val command = when {
+        "win" in os -> "arp -a $ip"
+        "nix" in os || "nux" in os || "aix" in os -> "arp -n $ip"
+        "mac" in os -> "arp -n $ip"
+        else -> null
+    }
+
+    if (command != null) {
+        val output = executeCommand(command)
+        if (output != null) {
+            val pattern = "([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})".toRegex()
+            return pattern.find(output)?.value
+        }
+    }
+    return null
+}
+
+
 fun main() {
-    // Optionally connect to PostgreSQL if credentials are provided.
     val dbUrl = System.getenv("POSTGRES_URL")
     val dbUser = System.getenv("POSTGRES_USER") ?: ""
     val dbPass = System.getenv("POSTGRES_PASSWORD") ?: ""
     if (dbUrl != null) {
         Database.connect(url = dbUrl, driver = "org.postgresql.Driver", user = dbUser, password = dbPass)
-        // Create the table on first run if it does not exist.
         transaction {
             SchemaUtils.createMissingTablesAndColumns(Rooms)
         }
     }
 
-    // Determine where the Rust API is hosted.  The default assumes
-    // rustycast is running on localhost port 3000.
     val rustServerBase = System.getenv("RUST_SERVER_BASE") ?: "http://localhost:3000"
 
-    // Build a Ktor HTTP client for talking to the Rust API.
     val client = HttpClient(CIO) {
         install(ContentNegotiation) {
             json(Json { ignoreUnknownKeys = true })
         }
     }
 
-    // Spin up the Ktor server on the configured port.  The lambda
-    // defines all routes in a single place for clarity.  Routes are
-    // kept simple and synchronous; in a production deployment you
-    // should add proper error handling, logging and authentication.
     val port = System.getenv("PORT")?.toIntOrNull() ?: 8080
     embeddedServer(Netty, port = port) {
+        install(ForwardedHeaders)
+        install(XForwardedHeaders)
+
         routing {
-            // Home page: simple index listing navigation options.
             get("/") {
                 call.respondHtml {
                     head {
@@ -98,18 +133,10 @@ fun main() {
                 }
             }
 
-            /**
-             * Pairings page: lists all current client/device pairings and
-             * provides forms to add or remove a pairing.  All operations
-             * delegate to the RustyCast HTTP API.  Upon completion we
-             * redirect back to this page.
-             */
             get("/pairings") {
-                // Fetch existing pairings from the Rust server.
                 val pairings: List<Pairing> = try {
                     client.get("$rustServerBase/api/pairings").body()
                 } catch (e: Exception) {
-                    // If the Rust API is unreachable, display an empty list.
                     emptyList()
                 }
                 call.respondHtml {
@@ -183,13 +210,6 @@ fun main() {
                 call.respondRedirect("/pairings")
             }
 
-            /**
-             * Mode page: displays the current forwarding mode and allows
-             * administrators to change it.  Underlying values mirror the
-             * `ForwardMode` enum in the Rust code.  The list here is kept
-             * simple; if you add new modes in Rust you should extend
-             * this list accordingly.
-             */
             get("/mode") {
                 val status: ModeStatus = try {
                     client.get("$rustServerBase/api/mode").body()
@@ -227,13 +247,6 @@ fun main() {
                 call.respondRedirect("/mode")
             }
 
-            /**
-             * Rooms page: demonstrates how you might persist additional
-             * metadata in a relational database alongside the sled store.
-             * If the POSTGRES_* environment variables are not set the
-             * rooms list will remain empty.  CRUD operations are
-             * intentionally minimal.
-             */
             get("/rooms") {
                 val dbPresent = dbUrl != null
                 val rooms: List<Room> = if (dbPresent) {
@@ -249,7 +262,7 @@ fun main() {
                         h1 { +"Rooms" }
                         if (!dbPresent) {
                             p {
-                                +"PostgreSQL connection not configured.  Set POSTGRES_URL, POSTGRES_USER and POSTGRES_PASSWORD to enable room management."
+                                +"PostgreSQL connection not configured. Set POSTGRES_URL, POSTGRES_USER and POSTGRES_PASSWORD to enable room management."
                             }
                         }
                         table {
@@ -257,6 +270,7 @@ fun main() {
                                 th { +"ID" }
                                 th { +"Name" }
                                 th { +"Device MAC" }
+                                th { +"Pairing QR Code" }
                                 th { +"Actions" }
                             }
                             rooms.forEach { room ->
@@ -264,6 +278,11 @@ fun main() {
                                     td { +room.id.toString() }
                                     td { +room.name }
                                     td { +(room.deviceMac ?: "") }
+                                    td {
+                                        if (room.deviceMac != null) {
+                                            img(src = "/qr-code/${room.id}")
+                                        }
+                                    }
                                     td {
                                         form(action = "/rooms/delete", method = FormMethod.post) {
                                             input(type = InputType.hidden, name = "id") { value = room.id.toString() }
@@ -291,6 +310,68 @@ fun main() {
                     }
                 }
             }
+
+            get("/qr-code/{roomId}") {
+                val roomId = call.parameters["roomId"]?.toIntOrNull()
+                if (roomId != null) {
+                    val room = transaction {
+                        Rooms.select { Rooms.id eq roomId }.map {
+                            Room(it[Rooms.id].value, it[Rooms.name], it[Rooms.deviceMac])
+                        }.singleOrNull()
+                    }
+
+                    if (room?.deviceMac != null) {
+                        val pairingUrl = "http://${call.request.local.host}:${call.request.local.port}/pair-room/${room.id}"
+
+                        val qrCodeImage = QRCode(pairingUrl).render().getBytes()
+
+                        call.respondBytes(qrCodeImage, ContentType.Image.PNG)
+                    }
+                }
+            }
+
+            get("/pair-room/{roomId}") {
+                val roomId = call.parameters["roomId"]?.toIntOrNull()
+                val clientIp = call.request.origin.remoteHost
+
+                if (roomId == null) {
+                    call.respond(HttpStatusCode.BadRequest, "Invalid Room ID")
+                    return@get
+                }
+
+                val room = transaction {
+                    Rooms.select { Rooms.id eq roomId }.map {
+                        Room(it[Rooms.id].value, it[Rooms.name], it[Rooms.deviceMac])
+                    }.singleOrNull()
+                }
+
+                if (room?.deviceMac == null) {
+                    call.respond(HttpStatusCode.NotFound, "Room not found or no device MAC configured")
+                    return@get
+                }
+
+                val clientMac = getMacAddressFromIp(clientIp)
+
+                if (clientMac == null) {
+                    call.respond(HttpStatusCode.InternalServerError, "Could not determine client MAC address from IP: $clientIp. This can happen if the device is on a different network subnet.")
+                    return@get
+                }
+
+                client.post("$rustServerBase/api/pairings") {
+                    contentType(ContentType.Application.Json)
+                    setBody(Pairing(clientMac, room.deviceMac))
+                }
+
+                call.respondHtml {
+                    head { title { +"Pairing Successful" } }
+                    body {
+                        h1 { +"Pairing Successful!" }
+                        p { +"Your device ($clientMac) has been paired with ${room.name}." }
+                    }
+                }
+            }
+
+
             post("/rooms/create") {
                 val params = call.receiveParameters()
                 val name = params["name"]
@@ -318,3 +399,4 @@ fun main() {
         }
     }.start(wait = true)
 }
+
